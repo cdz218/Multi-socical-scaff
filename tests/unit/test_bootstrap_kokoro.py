@@ -493,6 +493,51 @@ def test_download_language_model_does_not_follow_precreated_predictable_partial_
     assert outside.read_bytes() == b"outside sentinel"
 
 
+def test_verify_cache_rejects_tampered_extracted_model_with_regenerated_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = load_bootstrap_module()
+    root = tmp_path / "kokoro"
+    artifacts = _write_complete_cache(root, bootstrap)
+    _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
+    wheel = artifacts["language_model"]
+    _write_language_model_wheel(wheel, bootstrap)
+    monkeypatch.setitem(
+        bootstrap.APPROVED_ARTIFACT_SHA256,
+        "language_model",
+        bootstrap.sha256(wheel),
+    )
+    bootstrap.extract_language_model(wheel, root / "language-model")
+    extracted = bootstrap.language_model_directory(root)
+    (extracted / "config.cfg").write_text("tampered", encoding="utf-8")
+    (root / "verification.json").write_text(
+        json.dumps(bootstrap.artifact_manifest(root, artifacts)), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="language model"):
+        bootstrap.verify_cache(root)
+
+
+def test_verify_cache_rejects_symlinked_extracted_model_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = load_bootstrap_module()
+    root = tmp_path / "kokoro"
+    artifacts = _write_complete_cache(root, bootstrap)
+    _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
+    extracted = bootstrap.language_model_directory(root)
+    external = tmp_path / "external-model"
+    shutil.copytree(extracted, external)
+    shutil.rmtree(extracted)
+    extracted.symlink_to(external, target_is_directory=True)
+    (root / "verification.json").write_text(
+        json.dumps(bootstrap.artifact_manifest(root, artifacts)), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="language model"):
+        bootstrap.verify_cache(root)
+
+
 def test_verify_cache_rejects_missing_or_tampered_language_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -578,6 +623,7 @@ def _write_complete_cache(root: Path, bootstrap: object) -> dict[str, Path]:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         artifacts[artifact] = path
+    _write_language_model_wheel(artifacts["language_model"], bootstrap)
     _write_extracted_language_model(root, bootstrap)
     sf.write(root / "verification.wav", [0.0, 0.0], 24000)
     return artifacts

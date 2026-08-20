@@ -120,20 +120,33 @@ def _cache_path(root: Path, relative: str) -> Path:
     return candidate
 
 
-def _verify_language_model(root: Path, item: Mapping[str, Any]) -> None:
+def _verify_language_model(root: Path, wheel: Path) -> None:
     directory = language_model_directory(root)
     metadata = directory / "meta.json"
-    if not directory.is_dir() or not metadata.is_file():
+    resolved_root = root.resolve()
+    if (
+        directory.is_symlink()
+        or not directory.resolve(strict=False).is_relative_to(resolved_root)
+        or not directory.is_dir()
+        or not metadata.is_file()
+    ):
         raise RuntimeError("Kokoro cached language model is missing")
     try:
         model_metadata = json.loads(metadata.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         raise RuntimeError("Kokoro cached language model metadata is invalid") from error
-    if (
-        model_metadata.get("version") != ENGLISH_MODEL_VERSION
-        or item.get("extracted_sha256") != directory_sha256(directory)
-    ):
+    if model_metadata.get("version") != ENGLISH_MODEL_VERSION:
         raise RuntimeError("Kokoro cached language model does not match the verified wheel")
+
+    staging = root / f".language-model-verify-{uuid.uuid4().hex}"
+    if not staging.resolve(strict=False).is_relative_to(resolved_root):
+        raise RuntimeError("Kokoro language model staging path escapes the cache")
+    try:
+        extracted = _extract_language_model(wheel, staging)
+        if directory_sha256(directory) != directory_sha256(extracted):
+            raise RuntimeError("Kokoro cached language model does not match the verified wheel")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def verify_cache(root: Path) -> None:
@@ -186,7 +199,7 @@ def verify_cache(root: Path) -> None:
         ):
             raise RuntimeError("Kokoro verification manifest does not match approved cached artifacts")
         if artifact == "language_model":
-            _verify_language_model(root, item)
+            _verify_language_model(root, path)
 
     if not isinstance(wav_digest, str):
         raise RuntimeError("Kokoro verification manifest is missing the verification WAV digest")
