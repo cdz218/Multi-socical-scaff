@@ -5,11 +5,16 @@ import io
 import json
 import os
 import shutil
+import sys
+import types
 import zipfile
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
 import soundfile as sf
+
+from multichannel.config import ConfigurationError
 
 
 def load_bootstrap_module() -> object:
@@ -21,10 +26,13 @@ def load_bootstrap_module() -> object:
     return module
 
 
-def test_verify_cache_accepts_actual_required_kokoro_artifact_metadata(tmp_path: Path) -> None:
+def test_verify_cache_accepts_actual_required_kokoro_artifact_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     bootstrap = load_bootstrap_module()
     root = tmp_path / "kokoro"
     artifacts = _write_complete_cache(root, bootstrap)
+    _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
 
     manifest = bootstrap.artifact_manifest(root, artifacts)
     (root / "verification.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -43,6 +51,194 @@ def test_verify_cache_accepts_actual_required_kokoro_artifact_metadata(tmp_path:
     language_model = next(item for item in manifest["artifacts"] if item["artifact"] == "language_model")
     assert language_model["origin"] == bootstrap.ENGLISH_MODEL_ORIGIN
     assert all(item["version"] for item in manifest["artifacts"])
+
+
+def test_main_uses_script_repository_cache_when_called_from_foreign_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = load_bootstrap_module()
+    observed: list[Path] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bootstrap, "verify_cache", lambda root: observed.append(root))
+
+    assert bootstrap.main() == 0
+
+    assert observed == [Path(bootstrap.__file__).resolve().parents[1] / ".runtime" / "models" / "kokoro"]
+
+
+def test_main_rejects_runtime_symlink_before_external_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = load_bootstrap_module()
+    repository = tmp_path / "repository"
+    outside = tmp_path / "outside"
+    repository.mkdir()
+    outside.mkdir()
+    (repository / ".runtime").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(bootstrap, "repository_root", lambda: repository)
+    monkeypatch.setattr(bootstrap, "verify_cache", lambda _: pytest.fail("cache verification ran"))
+
+    with pytest.raises(ConfigurationError, match="outside"):
+        bootstrap.main()
+
+    assert not list(outside.iterdir())
+
+
+def test_verify_cache_rejects_self_consistent_fake_cache(tmp_path: Path) -> None:
+    bootstrap = load_bootstrap_module()
+    root = tmp_path / "kokoro"
+    artifacts = _write_complete_cache(root, bootstrap)
+    (root / "verification.json").write_text(
+        json.dumps(bootstrap.artifact_manifest(root, artifacts)), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="approved"):
+        bootstrap.verify_cache(root)
+
+
+def test_verify_cache_rejects_fake_language_wheel_with_matching_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = load_bootstrap_module()
+    root = tmp_path / "kokoro"
+    artifacts = _write_complete_cache(root, bootstrap)
+    approved = {artifact: bootstrap.sha256(path) for artifact, path in artifacts.items()}
+    approved["language_model"] = "0" * 64
+    monkeypatch.setattr(bootstrap, "APPROVED_ARTIFACT_SHA256", approved)
+    (root / "verification.json").write_text(
+        json.dumps(bootstrap.artifact_manifest(root, artifacts)), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="approved"):
+        bootstrap.verify_cache(root)
+
+
+def test_download_artifacts_uses_pinned_hugging_face_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = load_bootstrap_module()
+    artifact = tmp_path / "downloaded"
+    artifact.write_bytes(b"artifact")
+    calls: list[dict[str, str]] = []
+
+    def download(**kwargs: str) -> str:
+        calls.append(kwargs)
+        return str(artifact)
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=download))
+    monkeypatch.setattr(
+        bootstrap,
+        "APPROVED_ARTIFACT_SHA256",
+        {name: bootstrap.sha256(artifact) for name in bootstrap.required_artifacts()},
+    )
+
+    bootstrap.download_artifacts(tmp_path)
+
+    assert calls
+    assert all(call["revision"] == bootstrap.KOKORO_REVISION for call in calls)
+
+
+def test_main_injects_approved_local_kokoro_artifacts_without_internal_hub_downloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regenerate through real bootstrap wiring without allowing Kokoro fallbacks."""
+    bootstrap = load_bootstrap_module()
+    artifacts = {
+        "model_metadata": tmp_path / "approved-config.json",
+        "model_weights": tmp_path / "approved-model.pth",
+        "language_voice": tmp_path / "approved-voice.pt",
+    }
+    for path in artifacts.values():
+        path.write_bytes(b"approved")
+    language_wheel = tmp_path / bootstrap.ENGLISH_MODEL_WHEEL
+    language_wheel.write_bytes(b"approved wheel")
+    language_directory = tmp_path / "language-model"
+    language_directory.mkdir()
+    calls: dict[str, object] = {}
+    hub_calls: list[dict[str, object]] = []
+    verify_calls = 0
+
+    def fail_hub_download(**kwargs: object) -> str:
+        hub_calls.append(kwargs)
+        pytest.fail("Kokoro attempted an internal Hugging Face download")
+
+    class FakeKModel:
+        def __init__(self, *, config: str | None = None, model: str | None = None, **_: object) -> None:
+            if config is None or model is None:
+                fail_hub_download(repo_id="unexpected")
+            calls["model"] = self
+            calls["config"] = config
+            calls["weights"] = model
+
+    class FakeKPipeline:
+        def __init__(self, *, lang_code: str, model: object = True, **_: object) -> None:
+            if model is True:
+                fail_hub_download(repo_id="unexpected")
+            calls["pipeline_model"] = model
+            calls["lang_code"] = lang_code
+
+        def __call__(self, text: str, *, voice: str) -> object:
+            if not voice.endswith(".pt"):
+                fail_hub_download(repo_id="unexpected")
+            calls["voice"] = voice
+            return iter([(None, None, [0.0])])
+
+    kokoro_module = types.ModuleType("kokoro")
+    kokoro_model_module = types.ModuleType("kokoro.model")
+    kokoro_module.KPipeline = FakeKPipeline
+    kokoro_model_module.KModel = FakeKModel
+    monkeypatch.setitem(sys.modules, "kokoro", kokoro_module)
+    monkeypatch.setitem(sys.modules, "kokoro.model", kokoro_model_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(hf_hub_download=fail_hub_download),
+    )
+    monkeypatch.setattr(bootstrap, "repository_root", lambda: tmp_path)
+    monkeypatch.setattr(bootstrap, "download_artifacts", lambda _: artifacts)
+    monkeypatch.setattr(bootstrap, "download_language_model", lambda _: language_wheel)
+    monkeypatch.setattr(bootstrap, "extract_language_model", lambda *_: language_directory)
+    monkeypatch.setattr(bootstrap, "cached_english_model", lambda _: nullcontext())
+    monkeypatch.setattr(bootstrap, "artifact_manifest", lambda *_: {})
+
+    def verify_regeneration_path(_: Path) -> None:
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 1:
+            raise RuntimeError("cache requires regeneration")
+
+    monkeypatch.setattr(bootstrap, "verify_cache", verify_regeneration_path)
+
+    assert bootstrap.main() == 0
+
+    assert calls["config"] == str(artifacts["model_metadata"])
+    assert calls["weights"] == str(artifacts["model_weights"])
+    assert calls["pipeline_model"] is calls["model"]
+    assert calls["voice"] == str(artifacts["language_voice"])
+    assert hub_calls == []
+
+
+@pytest.mark.parametrize("artifact", ["model_metadata", "model_weights", "language_voice"])
+def test_download_artifacts_rejects_non_language_digest_mismatch_before_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str
+) -> None:
+    bootstrap = load_bootstrap_module()
+    downloaded = tmp_path / artifact
+    downloaded.write_bytes(b"wrong artifact")
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(hf_hub_download=lambda **_: str(downloaded)),
+    )
+    approved = {
+        name: bootstrap.sha256(downloaded)
+        for name in bootstrap.required_artifacts()
+    }
+    approved[artifact] = "0" * 64
+    monkeypatch.setattr(bootstrap, "APPROVED_ARTIFACT_SHA256", approved)
+
+    with pytest.raises(RuntimeError, match="approved"):
+        bootstrap.download_artifacts(tmp_path)
 
 
 def test_verify_cache_rejects_missing_required_kokoro_model_metadata(tmp_path: Path) -> None:
@@ -152,6 +348,8 @@ def test_main_reuses_verified_cache_without_downloading_or_rewriting(
     manifest_before = (root / "verification.json").read_bytes()
     wav_before = (root / "verification.wav").read_bytes()
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bootstrap, "repository_root", lambda: tmp_path)
+    _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
     monkeypatch.setattr(
         bootstrap,
         "download_artifacts",
@@ -169,10 +367,13 @@ def test_main_reuses_verified_cache_without_downloading_or_rewriting(
     assert (root / "verification.wav").read_bytes() == wav_before
 
 
-def test_verify_cache_rejects_altered_valid_verification_wav(tmp_path: Path) -> None:
+def test_verify_cache_rejects_altered_valid_verification_wav(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     bootstrap = load_bootstrap_module()
     source_root = tmp_path / "verified-kokoro"
     artifacts = _write_complete_cache(source_root, bootstrap)
+    _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
     (source_root / "verification.json").write_text(
         json.dumps(bootstrap.artifact_manifest(source_root, artifacts)), encoding="utf-8"
     )
@@ -184,10 +385,13 @@ def test_verify_cache_rejects_altered_valid_verification_wav(tmp_path: Path) -> 
         bootstrap.verify_cache(root)
 
 
-def test_verify_cache_rejects_manifest_without_verification_wav_digest(tmp_path: Path) -> None:
+def test_verify_cache_rejects_manifest_without_verification_wav_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     bootstrap = load_bootstrap_module()
     root = tmp_path / "kokoro"
     artifacts = _write_complete_cache(root, bootstrap)
+    _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
     manifest = bootstrap.artifact_manifest(root, artifacts)
     del manifest["verification_wav_sha256"]
     (root / "verification.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -196,10 +400,13 @@ def test_verify_cache_rejects_manifest_without_verification_wav_digest(tmp_path:
         bootstrap.verify_cache(root)
 
 
-def test_verify_cache_rejects_zero_frame_verification_wav(tmp_path: Path) -> None:
+def test_verify_cache_rejects_zero_frame_verification_wav(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     bootstrap = load_bootstrap_module()
     root = tmp_path / "kokoro"
     artifacts = _write_complete_cache(root, bootstrap)
+    _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
     sf.write(root / "verification.wav", [], bootstrap.SAMPLE_RATE)
     (root / "verification.json").write_text(
         json.dumps(bootstrap.artifact_manifest(root, artifacts)), encoding="utf-8"
@@ -247,10 +454,13 @@ def test_download_language_model_rejects_substituted_wheel_before_extraction(
     assert not (tmp_path / "downloads" / bootstrap.ENGLISH_MODEL_WHEEL).exists()
 
 
-def test_verify_cache_rejects_missing_or_tampered_language_model(tmp_path: Path) -> None:
+def test_verify_cache_rejects_missing_or_tampered_language_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     bootstrap = load_bootstrap_module()
     root = tmp_path / "kokoro"
     artifacts = _write_complete_cache(root, bootstrap)
+    _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
     manifest = bootstrap.artifact_manifest(root, artifacts)
     (root / "verification.json").write_text(json.dumps(manifest), encoding="utf-8")
 
@@ -271,6 +481,7 @@ def test_main_restores_hugging_face_environment_on_success_and_failure(
 ) -> None:
     bootstrap = load_bootstrap_module()
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bootstrap, "repository_root", lambda: tmp_path)
     monkeypatch.setenv("HF_HOME", "previous-home")
     monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", "previous-hub")
     root = tmp_path / ".runtime" / "models" / "kokoro"
@@ -280,6 +491,7 @@ def test_main_restores_hugging_face_environment_on_success_and_failure(
             bootstrap.main()
     else:
         artifacts = _write_complete_cache(root, bootstrap)
+        _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
         (root / "verification.json").write_text(
             json.dumps(bootstrap.artifact_manifest(root, artifacts)), encoding="utf-8"
         )
@@ -306,6 +518,16 @@ def _write_complete_cache(root: Path, bootstrap: object) -> dict[str, Path]:
     _write_extracted_language_model(root, bootstrap)
     sf.write(root / "verification.wav", [0.0, 0.0], 24000)
     return artifacts
+
+
+def _approve_fixture_artifacts(
+    monkeypatch: pytest.MonkeyPatch, bootstrap: object, artifacts: dict[str, Path]
+) -> None:
+    monkeypatch.setattr(
+        bootstrap,
+        "APPROVED_ARTIFACT_SHA256",
+        {artifact: bootstrap.sha256(path) for artifact, path in artifacts.items()},
+    )
 
 
 def _write_extracted_language_model(root: Path, bootstrap: object) -> Path:

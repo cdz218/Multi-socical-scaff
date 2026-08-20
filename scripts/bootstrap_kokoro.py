@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import urllib.request
 import uuid
 import zipfile
@@ -16,7 +17,15 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, cast
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from multichannel.config import RuntimePaths  # noqa: E402
+
+
 KOKORO_REPOSITORY = "hexgrad/Kokoro-82M"
+KOKORO_REVISION = "f3ff3571791e39611d31c381e3a41a3af07b4987"
 KOKORO_VERSION = "0.9.4"
 VOICE = "af_heart"
 SAMPLE_RATE = 24000
@@ -28,15 +37,18 @@ ENGLISH_MODEL_ORIGIN = (
     f"{ENGLISH_MODEL_PACKAGE}-{ENGLISH_MODEL_VERSION}/{ENGLISH_MODEL_WHEEL}"
 )
 ENGLISH_MODEL_WHEEL_SHA256 = "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
+APPROVED_ARTIFACT_SHA256 = {
+    "model_metadata": "5abb01e2403b072bf03d04fde160443e209d7a0dad49a423be15196b9b43c17f",
+    "model_weights": "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4",
+    "language_voice": "0ab5709b8ffab19bfd849cd11d98f75b60af7733253ad0d67b12382a102cb4ff",
+    "language_model": ENGLISH_MODEL_WHEEL_SHA256,
+}
 
 
 def required_artifacts() -> dict[str, str]:
-    """Read Kokoro's declared model name instead of duplicating a filename guess."""
-    from kokoro.model import KModel  # type: ignore[import-untyped]
-
     return {
         "model_metadata": "config.json",
-        "model_weights": KModel.MODEL_NAMES[KOKORO_REPOSITORY],
+        "model_weights": "kokoro-v1_0.pth",
         "language_voice": f"voices/{VOICE}.pt",
         "language_model": ENGLISH_MODEL_WHEEL,
     }
@@ -65,6 +77,11 @@ def artifact_details(artifact: str) -> tuple[str, str]:
     return KOKORO_VERSION, KOKORO_REPOSITORY
 
 
+def repository_root() -> Path:
+    """Return the repository owning this script, independently of caller CWD."""
+    return REPOSITORY_ROOT
+
+
 def language_model_directory(root: Path) -> Path:
     return root / "language-model" / ENGLISH_MODEL_PACKAGE / (
         f"{ENGLISH_MODEL_PACKAGE}-{ENGLISH_MODEL_VERSION}"
@@ -84,6 +101,8 @@ def artifact_manifest(root: Path, artifacts: Mapping[str, Path]) -> dict[str, An
             "origin": origin,
             "sha256": sha256(path),
         }
+        if artifact != "language_model":
+            item["revision"] = KOKORO_REVISION
         if artifact == "language_model":
             item["extracted_sha256"] = directory_sha256(language_model_directory(root))
         manifest_artifacts.append(item)
@@ -157,10 +176,12 @@ def verify_cache(root: Path) -> None:
             item.get("name") != expected[artifact]
             or item.get("version") != version
             or item.get("origin") != origin
+            or (artifact != "language_model" and item.get("revision") != KOKORO_REVISION)
             or not path.is_file()
             or sha256(path) != item.get("sha256")
+            or sha256(path) != APPROVED_ARTIFACT_SHA256[artifact]
         ):
-            raise RuntimeError("Kokoro verification manifest does not match cached artifacts")
+            raise RuntimeError("Kokoro verification manifest does not match approved cached artifacts")
         if artifact == "language_model":
             _verify_language_model(root, item)
 
@@ -181,11 +202,21 @@ def verify_cache(root: Path) -> None:
 def download_artifacts(root: Path) -> dict[str, Path]:
     from huggingface_hub import hf_hub_download
 
-    return {
-        artifact: Path(hf_hub_download(repo_id=KOKORO_REPOSITORY, filename=name))
-        for artifact, name in required_artifacts().items()
-        if artifact != "language_model"
-    }
+    artifacts: dict[str, Path] = {}
+    for artifact, name in required_artifacts().items():
+        if artifact == "language_model":
+            continue
+        downloaded = Path(
+            hf_hub_download(
+                repo_id=KOKORO_REPOSITORY,
+                filename=name,
+                revision=KOKORO_REVISION,
+            )
+        )
+        if sha256(downloaded) != APPROVED_ARTIFACT_SHA256[artifact]:
+            raise RuntimeError(f"Kokoro {artifact} digest is not approved")
+        artifacts[artifact] = downloaded
+    return artifacts
 
 
 def download_language_model(root: Path) -> Path:
@@ -315,7 +346,8 @@ def cached_english_model(model_directory: Path) -> Iterator[None]:
 
 
 def main() -> int:
-    root = Path.cwd() / ".runtime" / "models" / "kokoro"
+    paths = RuntimePaths.from_repository(repository_root())
+    root = paths.resolve_model_cache("kokoro")
     # Kokoro delegates downloads to Hugging Face; keep that cache repository-local.
     previous_environment = {
         key: os.environ.get(key) for key in ("HF_HOME", "HUGGINGFACE_HUB_CACHE")
@@ -332,6 +364,7 @@ def main() -> int:
             return 0
 
         from kokoro import KPipeline  # type: ignore[import-untyped]
+        from kokoro.model import KModel  # type: ignore[import-untyped]
         import soundfile as sf
 
         artifacts = download_artifacts(root)
@@ -340,8 +373,14 @@ def main() -> int:
         artifacts["language_model"] = language_wheel
         wav_path = root / "verification.wav"
         with cached_english_model(language_directory):
-            pipeline = KPipeline(lang_code="a", repo_id=KOKORO_REPOSITORY)
-            samples = next(pipeline("Kokoro bootstrap verification.", voice=VOICE))[2]
+            approved_model = KModel(
+                config=str(artifacts["model_metadata"]),
+                model=str(artifacts["model_weights"]),
+            )
+            pipeline = KPipeline(lang_code="a", model=approved_model)
+            samples = next(
+                pipeline("Kokoro bootstrap verification.", voice=str(artifacts["language_voice"]))
+            )[2]
         sf.write(wav_path, samples, SAMPLE_RATE)
         manifest_path = root / "verification.json"
         manifest_path.write_text(
