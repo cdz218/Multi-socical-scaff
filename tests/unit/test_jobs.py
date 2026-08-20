@@ -43,13 +43,25 @@ def _connection(tmp_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _insert_job(connection: sqlite3.Connection, state: str = "queued", job_id: str = "job-1") -> None:
+def _insert_job(
+    connection: sqlite3.Connection,
+    state: str = "queued",
+    job_id: str = "job-1",
+    worker_id: str = "worker",
+) -> None:
+    active_claim = state in {"claimed", "running"}
     connection.execute(
-        "INSERT INTO job_runs (id, job_type, subject_type, subject_id, state, created_at, updated_at) "
-        "VALUES (?, 'collect', 'channel', 'subject', ?, ?, ?)",
-        (job_id, state, NOW, NOW),
+        "INSERT INTO job_runs (id, job_type, subject_type, subject_id, state, worker_id, claim_token, "
+        "created_at, updated_at) VALUES (?, 'collect', 'channel', 'subject', ?, ?, ?, ?, ?)",
+        (job_id, state, worker_id if active_claim else None, "test-claim-token" if active_claim else None, NOW, NOW),
     )
     connection.commit()
+
+
+def _claim_token(connection: sqlite3.Connection) -> str:
+    token = connection.execute("SELECT claim_token FROM job_runs WHERE id='job-1'").fetchone()[0]
+    assert isinstance(token, str)
+    return token
 
 
 @pytest.fixture(autouse=True)
@@ -94,7 +106,15 @@ def test_generic_queued_to_claimed_transition_is_rejected_without_mutation(tmp_p
 def test_legal_transitions_emit_event(tmp_path: Path, old: str, new: str) -> None:
     connection = _connection(tmp_path)
     _insert_job(connection, old)
-    transition_job(connection, "job-1", old, new, "worker", now=NOW)
+    transition_job(
+        connection,
+        "job-1",
+        old,
+        new,
+        "worker",
+        claim_token=_claim_token(connection) if old in {"claimed", "running"} else None,
+        now=NOW,
+    )
     assert connection.execute("SELECT state FROM job_runs WHERE id='job-1'").fetchone() == (new,)
     assert connection.execute("SELECT from_state, to_state FROM job_events").fetchall() == [(old, new)]
 
@@ -127,7 +147,15 @@ def test_remaining_illegal_transition_matrix_does_not_mutate(
     before = _counts(connection)
 
     with pytest.raises(InvalidTransition):
-        transition_job(connection, "job-1", old, new, "worker", now=NOW)
+        transition_job(
+            connection,
+            "job-1",
+            old,
+            new,
+            "worker",
+            claim_token=_claim_token(connection) if old in {"claimed", "running"} else None,
+            now=NOW,
+        )
 
     assert connection.execute("SELECT state FROM job_runs WHERE id='job-1'").fetchone() == (old,)
     assert _counts(connection) == before
@@ -156,7 +184,7 @@ def test_partial_failure_is_sanitized_and_canonical(tmp_path: Path) -> None:
     _insert_job(connection, "running")
     error = RuntimeError(f"token={SECRET} https://user:pass@example.test/x?api_key={SECRET}\ntraceback")
     transition_job(
-        connection, "job-1", "running", "failed", "worker", now=NOW, error=error,
+        connection, "job-1", "running", "failed", "worker", claim_token=_claim_token(connection), now=NOW, error=error,
         partial_state={"Password": SECRET, "stage": "upload", "nested": {"token": SECRET}},
     )
     row = connection.execute(
@@ -164,7 +192,7 @@ def test_partial_failure_is_sanitized_and_canonical(tmp_path: Path) -> None:
     ).fetchone()
     assert row[0] == "RuntimeError"
     assert SECRET not in row[1] and "traceback" not in row[1] and "user:pass" not in row[1]
-    assert json.loads(row[2]) == {"nested": {"token": "[REDACTED]"}, "Password": "[REDACTED]", "stage": "upload"}
+    assert json.loads(row[2]) == {"[REDACTED]": "[REDACTED]", "nested": {"[REDACTED]": "[REDACTED]"}, "stage": "upload"}
     detail = connection.execute("SELECT detail_json FROM job_events").fetchone()[0]
     assert SECRET not in detail
     assert "traceback" not in detail
@@ -176,7 +204,7 @@ def test_credential_bearing_error_class_is_absent_from_job_and_event_rows(tmp_pa
     raw_error_class = "PasswordSecretClass_ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     error = type(raw_error_class, (RuntimeError,), {})("remote failure")
 
-    transition_job(connection, "job-1", "running", "failed", "worker", error=error, now=NOW)
+    transition_job(connection, "job-1", "running", "failed", "worker", claim_token=_claim_token(connection), error=error, now=NOW)
 
     error_class = connection.execute("SELECT error_class FROM job_runs").fetchone()[0]
     detail = connection.execute("SELECT detail_json FROM job_events").fetchone()[0]
@@ -202,6 +230,7 @@ def test_credential_shaped_values_are_sanitized_in_every_free_text_sink(tmp_path
         "claimed",
         "running",
         OPAQUE_CREDENTIAL,
+        claim_token=claim.claim_token,
         now=NOW,
     )
     error = RuntimeError(f"remote failure: {OPAQUE_CREDENTIAL}")
@@ -211,6 +240,7 @@ def test_credential_shaped_values_are_sanitized_in_every_free_text_sink(tmp_path
         "running",
         "failed",
         OPAQUE_CREDENTIAL,
+        claim_token=claim.claim_token,
         now=NOW,
         error=error,
         partial_state={"stage": OPAQUE_CREDENTIAL},
@@ -248,13 +278,14 @@ def test_credential_patterns_are_redacted_from_error_and_event_detail(
     tmp_path: Path, secret: str
 ) -> None:
     connection = _connection(tmp_path)
-    _insert_job(connection, "running")
+    _insert_job(connection, "running", worker_id="worker-01")
     transition_job(
         connection,
         "job-1",
         "running",
         "failed",
         "worker-01",
+        claim_token=_claim_token(connection),
         now=NOW,
         error=RuntimeError(f"remote failure: {secret}"),
         partial_state={"stage": secret},
@@ -281,8 +312,9 @@ def test_credential_patterns_are_redacted_from_error_and_event_detail(
 def test_sanitizer_preserves_safe_identifiers_and_urls(tmp_path: Path) -> None:
     connection = _connection(tmp_path)
     _insert_job(connection, "queued")
-    assert claim_job(connection, "job-1", "worker-01", NOW) is not None
-    transition_job(connection, "job-1", "claimed", "running", "worker-01", now=NOW)
+    claim = claim_job(connection, "job-1", "worker-01", NOW)
+    assert claim is not None
+    transition_job(connection, "job-1", "claimed", "running", "worker-01", claim_token=claim.claim_token, now=NOW)
     record_event(
         connection,
         "job-1",
@@ -300,7 +332,7 @@ def test_sanitizer_preserves_safe_identifiers_and_urls(tmp_path: Path) -> None:
         "worker-01",
         '{"message":"retry upload","url":"https://example.test/path?view=summary"}',
     )
-    transition_job(connection, "job-1", "running", "failed", "worker-01", now=NOW)
+    transition_job(connection, "job-1", "running", "failed", "worker-01", claim_token=claim.claim_token, now=NOW)
     request_key = "123e4567-e89b-12d3-a456-426614174000"
     assert requeue_job(connection, "job-1", "operator-01", "retry upload", request_key, now=NOW)
     assert connection.execute(
@@ -310,7 +342,7 @@ def test_sanitizer_preserves_safe_identifiers_and_urls(tmp_path: Path) -> None:
 
 def test_json_rejects_nan_and_is_deterministic(tmp_path: Path) -> None:
     connection = _connection(tmp_path)
-    _insert_job(connection, "running")
+    _insert_job(connection, "running", worker_id="worker-01")
     with pytest.raises(ValueError):
         transition_job(connection, "job-1", "running", "failed", "worker", partial_state={"x": float("nan")})
     with pytest.raises(ValueError):
@@ -322,23 +354,109 @@ def test_json_rejects_nan_and_is_deterministic(tmp_path: Path) -> None:
 def test_only_claim_owner_can_transition_claimed_or_running_job(tmp_path: Path) -> None:
     connection = _connection(tmp_path)
     _insert_job(connection)
-    assert claim_job(connection, "job-1", "worker-a", NOW) is not None
+    claim = claim_job(connection, "job-1", "worker-a", NOW)
+    assert claim is not None
     before = (
         connection.execute("SELECT state FROM job_runs WHERE id='job-1'").fetchone(),
         connection.execute("SELECT COUNT(*) FROM job_events").fetchone(),
     )
 
     with pytest.raises(InvalidTransition, match="owner"):
-        transition_job(connection, "job-1", "claimed", "running", "intruder", now=NOW)
+        transition_job(connection, "job-1", "claimed", "running", "intruder", claim_token=claim.claim_token, now=NOW)
 
     assert (
         connection.execute("SELECT state FROM job_runs WHERE id='job-1'").fetchone(),
         connection.execute("SELECT COUNT(*) FROM job_events").fetchone(),
     ) == before
-    transition_job(connection, "job-1", "claimed", "running", "worker-a", now=NOW)
+    transition_job(connection, "job-1", "claimed", "running", "worker-a", claim_token=claim.claim_token, now=NOW)
     with pytest.raises(InvalidTransition, match="owner"):
-        transition_job(connection, "job-1", "running", "failed", "intruder", now=NOW)
-    transition_job(connection, "job-1", "running", "failed", "worker-a", now=NOW)
+        transition_job(connection, "job-1", "running", "failed", "intruder", claim_token=claim.claim_token, now=NOW)
+    transition_job(connection, "job-1", "running", "failed", "worker-a", claim_token=claim.claim_token, now=NOW)
+
+
+def test_claimed_job_without_owner_or_claim_token_cannot_recover(tmp_path: Path) -> None:
+    connection = _connection(tmp_path)
+    _insert_job(connection, "claimed")
+    connection.execute("UPDATE job_runs SET worker_id=NULL, claim_token=NULL WHERE id='job-1'")
+    connection.commit()
+    before = _counts(connection)
+
+    with pytest.raises(InvalidTransition, match="ownership metadata"):
+        transition_job(
+            connection,
+            "job-1",
+            "claimed",
+            "queued",
+            "worker-a",
+            claim_token="claim-token",
+            now=NOW,
+        )
+
+    assert _counts(connection) == before
+    assert connection.execute("SELECT state FROM job_runs WHERE id='job-1'").fetchone() == ("claimed",)
+
+
+def test_standalone_events_reject_reserved_lifecycle_types_before_insert(tmp_path: Path) -> None:
+    connection = _connection(tmp_path)
+    _insert_job(connection, "queued")
+    before = _counts(connection)
+
+    for event_type in ("claimed", "state_transition", "requeued"):
+        with pytest.raises(InvalidTransition, match="reserved"):
+            record_event(connection, "job-1", event_type, "queued", "queued", "worker", {}, now=NOW)
+        assert _counts(connection) == before
+
+    record_event(connection, "job-1", "diagnostic", "queued", "queued", "worker", {}, now=NOW)
+    assert connection.execute("SELECT event_type FROM job_events").fetchone() == ("diagnostic",)
+
+
+def test_sensitive_mapping_keys_are_redacted_recursively_without_changing_safe_keys(
+    tmp_path: Path,
+) -> None:
+    connection = _connection(tmp_path)
+    _insert_job(connection, "running")
+    sensitive_keys = {
+        "token=round-six-token-in-key": "value",
+        OPAQUE_CREDENTIAL: "value",
+        "nested": {
+            "passcode": "value",
+            "cookie": "value",
+            "session": "value",
+            "ordinary_key": "safe value",
+        },
+    }
+
+    transition_job(
+        connection,
+        "job-1",
+        "running",
+        "failed",
+        "worker",
+        claim_token="test-claim-token",
+        partial_state=sensitive_keys,
+        now=NOW,
+    )
+    record_event(
+        connection,
+        "job-1",
+        "diagnostic",
+        "failed",
+        "failed",
+        "worker",
+        sensitive_keys,
+        now=NOW,
+    )
+
+    persisted = "\n".join(
+        str(value)
+        for table in ("job_runs", "job_events")
+        for row in connection.execute(f"SELECT * FROM {table}").fetchall()
+        for value in row
+    )
+    for raw_key in ("token=round-six-token-in-key", OPAQUE_CREDENTIAL, "passcode", "cookie", "session"):
+        assert raw_key not in persisted
+    partial_state = json.loads(connection.execute("SELECT partial_state_json FROM job_runs").fetchone()[0])
+    assert partial_state["nested"]["ordinary_key"] == "safe value"
 
 
 def test_standalone_event_cannot_forge_state_history_or_leak_structural_text(tmp_path: Path) -> None:
@@ -382,7 +500,7 @@ def test_secret_aliases_and_private_key_pem_are_redacted_recursively(tmp_path: P
         "message": pem,
     }
     transition_job(
-        connection, "job-1", "running", "failed", "worker", partial_state=aliases, now=NOW
+        connection, "job-1", "running", "failed", "worker", claim_token=_claim_token(connection), partial_state=aliases, now=NOW
     )
     record_event(connection, "job-1", "diagnostic", "failed", "failed", "worker", aliases, now=NOW)
     persisted = "\n".join(
@@ -413,7 +531,7 @@ def test_nonfinite_json_values_reject_before_redaction_or_mutation(
 
     with pytest.raises(ValueError):
         transition_job(
-            connection, "job-1", "running", "failed", "worker", partial_state={key: value}, now=NOW
+            connection, "job-1", "running", "failed", "worker", claim_token=_claim_token(connection), partial_state={key: value}, now=NOW
         )
     with pytest.raises(ValueError):
         record_event(connection, "job-1", "diagnostic", "running", "running", "worker", {key: value}, now=NOW)
@@ -460,6 +578,7 @@ def test_percent_encoded_url_credentials_are_redacted_without_rewriting_safe_url
         "running",
         "failed",
         "worker",
+        claim_token=_claim_token(connection),
         error=RuntimeError(url),
         partial_state={"url": url},
         now=NOW,
@@ -555,8 +674,8 @@ def test_credential_identity_pseudonyms_are_stable_and_never_opaque(tmp_path: Pa
     assert not _is_opaque_credential(claim.worker_id)
     assert _sanitize_identity(credential) == claim.worker_id
     assert _sanitize_identity(claim.worker_id) != claim.worker_id
-    transition_job(connection, "job-1", "claimed", "running", credential, now=NOW)
-    transition_job(connection, "job-1", "running", "failed", credential, now=NOW)
+    transition_job(connection, "job-1", "claimed", "running", credential, claim_token=claim.claim_token, now=NOW)
+    transition_job(connection, "job-1", "running", "failed", credential, claim_token=claim.claim_token, now=NOW)
     assert requeue_job(
         connection,
         "job-1",
@@ -623,13 +742,14 @@ def test_reserved_identity_pseudonym_input_is_domain_hashed_and_raw_absent(tmp_p
 )
 def test_credentials_in_url_components_are_redacted(tmp_path: Path, url: str) -> None:
     connection = _connection(tmp_path)
-    _insert_job(connection, "running")
+    _insert_job(connection, "running", worker_id="worker-01")
     transition_job(
         connection,
         "job-1",
         "running",
         "failed",
         "worker-01",
+        claim_token=_claim_token(connection),
         now=NOW,
         error=RuntimeError(url),
         partial_state={"url": url},
@@ -674,7 +794,7 @@ def test_claimed_job_can_still_recover_to_queued(tmp_path: Path) -> None:
     connection = _connection(tmp_path)
     _insert_job(connection, "claimed")
 
-    transition_job(connection, "job-1", "claimed", "queued", "worker", now=NOW)
+    transition_job(connection, "job-1", "claimed", "queued", "worker", claim_token=_claim_token(connection), now=NOW)
 
     assert connection.execute("SELECT state FROM job_runs WHERE id='job-1'").fetchone() == ("queued",)
 

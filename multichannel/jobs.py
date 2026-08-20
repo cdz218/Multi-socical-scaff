@@ -77,6 +77,12 @@ _SECRET_QUERY_KEY = re.compile(
     r"credential|pass(?:word|wd)|private[_-]?key|secret|token|auth)",
     re.I,
 )
+_SENSITIVE_ASSIGNMENT_KEY = re.compile(
+    r"(?:api[_-]?key|access[_-]?key|authorization|bearer|client[_-]?secret|credential|"
+    r"pass(?:word|wd|code)?|private[_-]?key|secret|token|cookie|session)\s*[=:]",
+    re.I,
+)
+_SENSITIVE_MAPPING_KEY = re.compile(r"(?:passcode|cookie|session)", re.I)
 _PRIVATE_KEY_PEM = re.compile(r"-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----", re.I)
 _UTC_ISO_8601 = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
@@ -204,10 +210,15 @@ def _sanitize_identity(value: str, *, internal: bool = False) -> str:
 
 
 def _sanitize(value: Any, key: str | None = None) -> Any:
-    if key is not None and _SECRET_KEY.search(_decoded(key)):
+    if key is not None and _sensitive_mapping_key(key):
         return "[REDACTED]"
     if isinstance(value, Mapping):
-        return {str(item_key): _sanitize(item_value, str(item_key)) for item_key, item_value in value.items()}
+        sanitized: dict[str, Any] = {}
+        for item_key, item_value in value.items():
+            raw_key = str(item_key)
+            safe_key = "[REDACTED]" if _sensitive_mapping_key(raw_key) else raw_key
+            sanitized[safe_key] = _sanitize(item_value, raw_key)
+        return sanitized
     if isinstance(value, (list, tuple)):
         return [_sanitize(item) for item in value]
     if isinstance(value, str):
@@ -215,6 +226,16 @@ def _sanitize(value: Any, key: str | None = None) -> Any:
             return "[REDACTED]"
         return _sanitize_text(value)
     return value
+
+
+def _sensitive_mapping_key(key: str) -> bool:
+    decoded = _decoded(key)
+    return (
+        _SECRET_KEY.search(decoded) is not None
+        or _SENSITIVE_ASSIGNMENT_KEY.search(decoded) is not None
+        or _SENSITIVE_MAPPING_KEY.search(decoded) is not None
+        or _is_opaque_credential(decoded)
+    )
 
 
 def _looks_sensitive(value: str) -> bool:
@@ -314,6 +335,8 @@ def record_event(
     safe_actor = _sanitize_identity(actor)
     detail_json = _json(detail)
     safe_event_type = _sanitize_text(event_type)
+    if safe_event_type in {"claimed", "state_transition", "requeued"}:
+        raise InvalidTransition("reserved lifecycle event types are written internally")
     safe_from_state = _sanitize_text(from_state) if from_state is not None else None
     safe_to_state = _sanitize_text(to_state) if to_state is not None else None
     try:
@@ -392,6 +415,7 @@ def transition_job(
     new_state: str,
     actor: str,
     *,
+    claim_token: str | None = None,
     now: str | None = None,
     error: BaseException | None = None,
     partial_state: Mapping[str, Any] | None = None,
@@ -433,17 +457,27 @@ def transition_job(
     try:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
-            "SELECT state, worker_id FROM job_runs WHERE id=?", (job_id,)
+            "SELECT state, worker_id, claim_token FROM job_runs WHERE id=?", (job_id,)
         ).fetchone()
         if row is None:
             raise JobNotFound(job_id)
         if row[0] != expected_state:
             raise InvalidTransition(f"job {job_id} is not {expected_state}")
-        if expected_state in {"claimed", "running"} and row[1] is not None and safe_actor != row[1]:
-            raise InvalidTransition("only the assigned worker owner may transition this job")
+        if expected_state in {"claimed", "running"}:
+            if row[1] is None or row[2] is None:
+                raise InvalidTransition("claim ownership metadata is incomplete")
+            if safe_actor != row[1]:
+                raise InvalidTransition("only the assigned worker owner may transition this job")
+            if claim_token is None or claim_token != row[2]:
+                raise InvalidTransition("claim token does not match the active claim")
+        predicate = "id=? AND state=?"
+        predicate_values: list[Any] = [job_id, expected_state]
+        if expected_state in {"claimed", "running"}:
+            predicate += " AND worker_id=? AND claim_token=?"
+            predicate_values.extend([row[1], row[2]])
         cursor = connection.execute(
-            f"UPDATE job_runs SET {', '.join(assignments)} WHERE id=? AND state=?",
-            (*values, job_id, expected_state),
+            f"UPDATE job_runs SET {', '.join(assignments)} WHERE {predicate}",
+            (*values, *predicate_values),
         )
         if cursor.rowcount != 1:
             raise InvalidTransition(f"job {job_id} is not {expected_state}")

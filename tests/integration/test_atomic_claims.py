@@ -90,9 +90,56 @@ def test_claimed_job_can_transition_to_running(tmp_path: Path) -> None:
         (NOW, NOW),
     )
     connection.commit()
-    assert claim_job(connection, "job-1", "worker", NOW)
-    transition_job(connection, "job-1", "claimed", "running", "worker", now=NOW)
+    claim = claim_job(connection, "job-1", "worker", NOW)
+    assert claim is not None
+    transition_job(connection, "job-1", "claimed", "running", "worker", claim_token=claim.claim_token, now=NOW)
     assert connection.execute("SELECT state FROM job_runs").fetchone() == ("running",)
+
+
+def test_stale_claim_token_cannot_transition_reclaimed_job(tmp_path: Path) -> None:
+    connection = connect(tmp_path / "stale-token.sqlite3")
+    migrate(connection)
+    connection.execute(
+        "INSERT INTO job_runs (id, job_type, subject_type, subject_id, state, created_at, updated_at) VALUES ('job-1','collect','channel','s','queued',?,?)",
+        (NOW, NOW),
+    )
+    connection.commit()
+    first_claim = claim_job(connection, "job-1", "worker", NOW)
+    assert first_claim is not None
+    transition_job(
+        connection,
+        "job-1",
+        "claimed",
+        "queued",
+        "worker",
+        claim_token=first_claim.claim_token,
+        now=NOW,
+    )
+    second_claim = claim_job(connection, "job-1", "worker", NOW)
+    assert second_claim is not None
+    assert second_claim.claim_token != first_claim.claim_token
+
+    with pytest.raises(InvalidTransition, match="claim token"):
+        transition_job(
+            connection,
+            "job-1",
+            "claimed",
+            "running",
+            "worker",
+            claim_token=first_claim.claim_token,
+            now=NOW,
+        )
+
+    transition_job(
+        connection,
+        "job-1",
+        "claimed",
+        "running",
+        "worker",
+        claim_token=second_claim.claim_token,
+        now=NOW,
+    )
+    assert connection.execute("SELECT state FROM job_runs WHERE id='job-1'").fetchone() == ("running",)
 
 
 def test_concurrent_transitions_return_application_error_not_sqlite_lock(
@@ -101,7 +148,8 @@ def test_concurrent_transitions_return_application_error_not_sqlite_lock(
     path = tmp_path / "transition-race.sqlite3"
     _setup(path)
     connection = connect(path)
-    assert claim_job(connection, "job-1", "worker", NOW) is not None
+    claim = claim_job(connection, "job-1", "worker", NOW)
+    assert claim is not None
     connection.close()
     read_barrier = threading.Barrier(2)
     outcomes: list[str] = []
@@ -117,7 +165,7 @@ def test_concurrent_transitions_return_application_error_not_sqlite_lock(
                 trace_state.deferred_begin = True
             elif (
                 trace_state.deferred_begin
-                and statement.startswith("SELECT state, worker_id FROM job_runs")
+                and statement.startswith("SELECT state, worker_id, claim_token FROM job_runs")
             ):
                 read_barrier.wait(timeout=5)
 
@@ -125,7 +173,7 @@ def test_concurrent_transitions_return_application_error_not_sqlite_lock(
             synchronize_deferred_read
         )
         try:
-            transition_job(worker_connection, "job-1", "claimed", target_state, "worker", now=NOW)
+            transition_job(worker_connection, "job-1", "claimed", target_state, "worker", claim_token=claim.claim_token, now=NOW)
             outcomes.append(target_state)
         except BaseException as error:
             errors.append(error)
