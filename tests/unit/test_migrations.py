@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -30,7 +32,7 @@ def test_migrate_is_idempotent_and_creates_only_foundation_tables(tmp_path: Path
 
     assert migrate(connection) == 1
     assert migrate(connection) == 1
-    assert _table_names(connection) >= {
+    assert _table_names(connection) == {
         "schema_migrations",
         "channels",
         "platform_accounts",
@@ -372,16 +374,81 @@ def test_existing_0001_database_is_unchanged_on_repeat_migration(tmp_path: Path)
 
 
 def test_factories_generate_uuid_ids_and_utc_z_timestamps() -> None:
-    channel = factories.channel()
-    account = factories.platform_account(channel.id)
-    run = factories.job_run()
-    event = factories.job_event(run.id)
-    request = factories.requeue_request(run.id)
+    channels = (factories.channel(), factories.channel())
+    accounts = tuple(factories.platform_account(channel.id) for channel in channels)
+    runs = (factories.job_run(), factories.job_run())
+    events = tuple(factories.job_event(run.id) for run in runs)
+    requests = tuple(factories.requeue_request(run.id) for run in runs)
+    values = (*channels, *accounts, *runs, *events, *requests)
 
-    values = (channel, account, run, event, request)
-    assert all(value.id != "1" for value in values)
-    assert len({value.id for value in values}) == len(values)
-    assert all(value.created_at.endswith("Z") for value in values)
+    ids = [value.id for value in values]
+    assert len(set(ids)) == len(ids)
+    for value_id in ids:
+        assert str(UUID(value_id)) == value_id
+    timestamps = [value.created_at for value in values] + [run.updated_at for run in runs]
+    for timestamp in timestamps:
+        assert timestamp.endswith("Z")
+        assert datetime.fromisoformat(timestamp.replace("Z", "+00:00")).tzinfo is not None
+
+
+def test_repeated_factories_insert_schema_unique_defaults(tmp_path: Path) -> None:
+    connection = connect(tmp_path / "state.sqlite3")
+    migrate(connection)
+    channels = (factories.channel(), factories.channel())
+    runs = (factories.job_run(), factories.job_run())
+    requests = tuple(factories.requeue_request(run.id) for run in runs)
+
+    connection.executemany(
+        """
+        INSERT INTO channels (id, slug, name, locale, enabled, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (channel.id, channel.slug, channel.name, channel.locale, channel.enabled, channel.created_at)
+            for channel in channels
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO job_runs (
+          id, job_type, subject_type, subject_id, state, attempt_count, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                run.id,
+                run.job_type,
+                run.subject_type,
+                run.subject_id,
+                run.state,
+                run.attempt_count,
+                run.created_at,
+                run.updated_at,
+            )
+            for run in runs
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO requeue_requests (id, job_run_id, request_key, operator, reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                request.id,
+                request.job_run_id,
+                request.request_key,
+                request.operator,
+                request.reason,
+                request.created_at,
+            )
+            for request in requests
+        ],
+    )
+    connection.commit()
+
+    assert connection.execute("SELECT COUNT(*) FROM channels").fetchone() == (2,)
+    assert connection.execute("SELECT COUNT(*) FROM requeue_requests").fetchone() == (2,)
 
 
 def test_factory_child_rows_enforce_foreign_keys(tmp_path: Path) -> None:

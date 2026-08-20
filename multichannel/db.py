@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,10 +24,23 @@ class MigrationError(RuntimeError):
 
 
 def connect(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path)
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA busy_timeout=5000")
+    connection = sqlite3.connect(path, timeout=5)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error).lower() or time.monotonic() >= deadline:
+                    raise
+                # SQLite can return SQLITE_BUSY immediately while another connection changes WAL mode.
+                time.sleep(0.01)
+    except Exception:
+        connection.close()
+        raise
     return connection
 
 
@@ -138,16 +152,25 @@ def migrate(connection: sqlite3.Connection) -> int:
     migration_sql = {path: path.read_bytes().decode("utf-8") for _, path in migrations}
     for _, path in migrations:
         _validate_migration_sql(path, migration_sql[path])
-    history_exists = _has_history(connection)
-    recorded_checksums = _validate_history(connection, migrations) if history_exists else {}
+    if not migrations:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            _ensure_history(connection)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
     for migration_number, path in migrations:
         migration_id = f"{migration_number:04d}"
         sql = path.read_bytes()
         checksum = hashlib.sha256(sql).hexdigest()
-        if migration_id in recorded_checksums:
-            continue
         try:
             connection.execute("BEGIN IMMEDIATE")
+            history_exists = _has_history(connection)
+            recorded_checksums = _validate_history(connection, migrations) if history_exists else {}
+            if migration_id in recorded_checksums:
+                connection.commit()
+                continue
             statement_sql = migration_sql[path]
             if not history_exists and not _creates_history(statement_sql):
                 _ensure_history(connection)
@@ -157,12 +180,9 @@ def migrate(connection: sqlite3.Connection) -> int:
                 (migration_id, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), checksum),
             )
             connection.commit()
-            history_exists = True
         except Exception:
             connection.rollback()
             raise
-    if not history_exists:
-        _ensure_history(connection)
     count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
     if count is None:
         raise MigrationError("migration history count was unavailable")

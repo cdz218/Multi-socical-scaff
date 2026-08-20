@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 from multichannel.models import Channel, JobEvent, JobRun, PlatformAccount, RequeueRequest
 
 
 def channel() -> Channel:
-    return Channel(slug="example-channel", name="Example Channel")
+    return Channel(slug=f"example-channel-{uuid4().hex}", name="Example Channel")
 
 
 def platform_account(channel_id: str) -> PlatformAccount:
@@ -29,7 +31,7 @@ def job_event(job_run_id: str) -> JobEvent:
 def requeue_request(job_run_id: str) -> RequeueRequest:
     return RequeueRequest(
         job_run_id=job_run_id,
-        request_key="test-request",
+        request_key=f"test-request-{uuid4().hex}",
         operator="test",
         reason="test fixture",
     )
