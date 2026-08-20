@@ -71,7 +71,7 @@ _KNOWN_PREFIX = re.compile(
     re.I,
 )
 _OPAQUE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])")
-_UUID = re.compile(r"^[0-9a-f]{8}[0-9a-f]{4}[1-5][0-9a-f]{3}[89ab][0-9a-f]{12}$", re.I)
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
 _SECRET_QUERY_KEY = re.compile(
     r"(?:api[_-]?key|access[_-]?key|authorization|bearer|client[_-]?secret|"
     r"credential|pass(?:word|wd)|private[_-]?key|secret|token|auth)",
@@ -235,7 +235,21 @@ def _sensitive_mapping_key(key: str) -> bool:
         or _SENSITIVE_ASSIGNMENT_KEY.search(decoded) is not None
         or _SENSITIVE_MAPPING_KEY.search(decoded) is not None
         or _is_opaque_credential(decoded)
+        or _is_opaque_mapping_key(decoded)
     )
+
+
+def _is_opaque_mapping_key(value: str) -> bool:
+    compact = value.strip()
+    if (
+        len(compact) < 32
+        or re.fullmatch(r"[a-z0-9_-]+", compact) is None
+        or _UUID.fullmatch(compact) is not None
+        or re.search(r"[a-z]", compact) is None
+        or not re.search(r"\d", compact)
+    ):
+        return False
+    return len(set(compact)) >= 12
 
 
 def _looks_sensitive(value: str) -> bool:

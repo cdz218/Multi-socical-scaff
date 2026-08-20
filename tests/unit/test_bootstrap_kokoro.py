@@ -473,6 +473,26 @@ def test_download_language_model_rejects_substituted_wheel_before_extraction(
     assert not (tmp_path / "downloads" / bootstrap.ENGLISH_MODEL_WHEEL).exists()
 
 
+def test_download_language_model_does_not_follow_precreated_predictable_partial_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = load_bootstrap_module()
+    expected = b"approved wheel"
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    predictable_partial = (downloads / bootstrap.ENGLISH_MODEL_WHEEL).with_suffix(".partial")
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside sentinel")
+    predictable_partial.symlink_to(outside)
+    monkeypatch.setattr(bootstrap, "ENGLISH_MODEL_WHEEL_SHA256", bootstrap.hashlib.sha256(expected).hexdigest())
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", lambda _: io.BytesIO(expected))
+
+    wheel = bootstrap.download_language_model(tmp_path)
+
+    assert wheel.read_bytes() == expected
+    assert outside.read_bytes() == b"outside sentinel"
+
+
 def test_verify_cache_rejects_missing_or_tampered_language_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

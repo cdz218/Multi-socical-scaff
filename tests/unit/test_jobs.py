@@ -459,6 +459,55 @@ def test_sensitive_mapping_keys_are_redacted_recursively_without_changing_safe_k
     assert partial_state["nested"]["ordinary_key"] == "safe value"
 
 
+def test_lowercase_credential_shaped_mapping_keys_are_redacted_recursively(
+    tmp_path: Path,
+) -> None:
+    connection = _connection(tmp_path)
+    _insert_job(connection, "running")
+    lowercase_credential = "m4k9p2x7v8n3c6b5z1q0w9e8r7t6y5u4"
+    details = {
+        "stage": "upload",
+        "ordinary_key": "safe value",
+        "safe_url": "https://example.test/path?view=summary",
+        "123e4567-e89b-12d3-a456-426614174000": "safe uuid key",
+        "nested": {lowercase_credential: "must not persist"},
+    }
+
+    transition_job(
+        connection,
+        "job-1",
+        "running",
+        "failed",
+        "worker",
+        claim_token=_claim_token(connection),
+        partial_state=details,
+        now=NOW,
+    )
+    record_event(
+        connection,
+        "job-1",
+        "diagnostic",
+        "failed",
+        "failed",
+        "worker",
+        details,
+        now=NOW,
+    )
+
+    persisted = "\n".join(
+        str(value)
+        for table in ("job_runs", "job_events")
+        for row in connection.execute(f"SELECT * FROM {table}").fetchall()
+        for value in row
+    )
+    assert lowercase_credential not in persisted
+    partial_state = json.loads(connection.execute("SELECT partial_state_json FROM job_runs").fetchone()[0])
+    assert partial_state["stage"] == "upload"
+    assert partial_state["ordinary_key"] == "safe value"
+    assert partial_state["safe_url"] == "https://example.test/path?view=summary"
+    assert partial_state["123e4567-e89b-12d3-a456-426614174000"] == "safe uuid key"
+
+
 def test_standalone_event_cannot_forge_state_history_or_leak_structural_text(tmp_path: Path) -> None:
     connection = _connection(tmp_path)
     _insert_job(connection, "running")

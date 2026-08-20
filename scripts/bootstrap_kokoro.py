@@ -224,21 +224,56 @@ def download_artifacts(root: Path) -> dict[str, Path]:
 
 def download_language_model(root: Path) -> Path:
     """Cache the approved wheel without involving the Python package installer."""
-    destination = root / "downloads" / ENGLISH_MODEL_WHEEL
+    resolved_root = root.resolve(strict=False)
+    if root.is_symlink():
+        raise RuntimeError("Kokoro cache root must not be a symlink")
+    downloads = root / "downloads"
+    if downloads.is_symlink():
+        raise RuntimeError("Kokoro downloads directory must not be a symlink")
+    downloads.mkdir(parents=True, exist_ok=True)
+    resolved_downloads = downloads.resolve(strict=False)
+    if not resolved_downloads.is_relative_to(resolved_root) or not downloads.is_dir():
+        raise RuntimeError("Kokoro downloads directory escapes the cache")
+    destination = downloads / ENGLISH_MODEL_WHEEL
+    if destination.is_symlink():
+        raise RuntimeError("Kokoro language model wheel must not be a symlink")
     if destination.is_file():
         if sha256(destination) != ENGLISH_MODEL_WHEEL_SHA256:
             raise RuntimeError("Kokoro language model wheel digest is not approved")
         return destination
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(".partial")
+    temporary: Path | None = None
+    output_fd: int | None = None
     try:
-        with urllib.request.urlopen(ENGLISH_MODEL_ORIGIN) as response, temporary.open("wb") as output:
+        for _ in range(5):
+            candidate = downloads / f".{ENGLISH_MODEL_WHEEL}.{uuid.uuid4().hex}.partial"
+            if not candidate.resolve(strict=False).is_relative_to(resolved_root):
+                raise RuntimeError("Kokoro staging path escapes the cache")
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                output_fd = os.open(candidate, flags, 0o600)
+            except FileExistsError:
+                continue
+            temporary = candidate
+            break
+        if output_fd is None or temporary is None:
+            raise RuntimeError("could not create a private Kokoro staging file")
+        with urllib.request.urlopen(ENGLISH_MODEL_ORIGIN) as response, os.fdopen(output_fd, "wb") as output:
+            output_fd = None
             shutil.copyfileobj(response, output)
+            output.flush()
+            os.fsync(output.fileno())
         if sha256(temporary) != ENGLISH_MODEL_WHEEL_SHA256:
             raise RuntimeError("Kokoro language model wheel digest is not approved")
+        if destination.is_symlink():
+            raise RuntimeError("Kokoro language model wheel must not be a symlink")
         temporary.replace(destination)
     finally:
-        temporary.unlink(missing_ok=True)
+        if output_fd is not None:
+            os.close(output_fd)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return destination
 
 
