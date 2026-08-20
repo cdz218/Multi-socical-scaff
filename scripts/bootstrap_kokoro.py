@@ -139,6 +139,9 @@ def _verify_language_model(root: Path, item: Mapping[str, Any]) -> None:
 def verify_cache(root: Path) -> None:
     manifest_path = root / "verification.json"
     wav_path = root / "verification.wav"
+    resolved_root = root.resolve()
+    if wav_path.is_symlink() or not wav_path.resolve(strict=False).is_relative_to(resolved_root):
+        raise RuntimeError("Kokoro verification WAV escapes the cache")
     if not manifest_path.is_file() or not wav_path.is_file():
         raise RuntimeError("Kokoro verification manifest or WAV is missing")
 
@@ -350,10 +353,12 @@ def main() -> int:
     root = paths.resolve_model_cache("kokoro")
     # Kokoro delegates downloads to Hugging Face; keep that cache repository-local.
     previous_environment = {
-        key: os.environ.get(key) for key in ("HF_HOME", "HUGGINGFACE_HUB_CACHE")
+        key: os.environ.get(key)
+        for key in ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE")
     }
     try:
         os.environ["HF_HOME"] = str(root)
+        os.environ["HF_HUB_CACHE"] = str(root / "hub")
         os.environ["HUGGINGFACE_HUB_CACHE"] = str(root / "hub")
         root.mkdir(parents=True, exist_ok=True)
         try:

@@ -385,6 +385,25 @@ def test_verify_cache_rejects_altered_valid_verification_wav(
         bootstrap.verify_cache(root)
 
 
+def test_verify_cache_rejects_verification_wav_symlink_to_absolute_external_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = load_bootstrap_module()
+    root = tmp_path / "kokoro"
+    artifacts = _write_complete_cache(root, bootstrap)
+    _approve_fixture_artifacts(monkeypatch, bootstrap, artifacts)
+    external_wav = tmp_path / "outside.wav"
+    external_wav.write_bytes((root / "verification.wav").read_bytes())
+    (root / "verification.wav").unlink()
+    (root / "verification.wav").symlink_to(external_wav)
+    (root / "verification.json").write_text(
+        json.dumps(bootstrap.artifact_manifest(root, artifacts)), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="WAV.*cache"):
+        bootstrap.verify_cache(root)
+
+
 def test_verify_cache_rejects_manifest_without_verification_wav_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -483,6 +502,7 @@ def test_main_restores_hugging_face_environment_on_success_and_failure(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(bootstrap, "repository_root", lambda: tmp_path)
     monkeypatch.setenv("HF_HOME", "previous-home")
+    monkeypatch.setenv("HF_HUB_CACHE", "previous-effective-hub")
     monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", "previous-hub")
     root = tmp_path / ".runtime" / "models" / "kokoro"
     if fail:
@@ -498,7 +518,30 @@ def test_main_restores_hugging_face_environment_on_success_and_failure(
         assert bootstrap.main() == 0
 
     assert os.environ["HF_HOME"] == "previous-home"
+    assert os.environ["HF_HUB_CACHE"] == "previous-effective-hub"
     assert os.environ["HUGGINGFACE_HUB_CACHE"] == "previous-hub"
+
+
+def test_main_sets_effective_hugging_face_hub_cache_for_downloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = load_bootstrap_module()
+    root = tmp_path / ".runtime" / "models" / "kokoro"
+    monkeypatch.setattr(bootstrap, "repository_root", lambda: tmp_path)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "outside-hub"))
+    monkeypatch.delitem(sys.modules, "huggingface_hub.constants", raising=False)
+    monkeypatch.delitem(sys.modules, "huggingface_hub", raising=False)
+
+    def inspect_effective_cache(_: Path) -> dict[str, Path]:
+        from huggingface_hub import constants
+
+        assert Path(constants.HF_HUB_CACHE) == root / "hub"
+        raise RuntimeError("stop after effective cache inspection")
+
+    monkeypatch.setattr(bootstrap, "download_artifacts", inspect_effective_cache)
+
+    with pytest.raises(RuntimeError, match="stop after effective cache inspection"):
+        bootstrap.main()
 
 
 def _write_complete_cache(root: Path, bootstrap: object) -> dict[str, Path]:
