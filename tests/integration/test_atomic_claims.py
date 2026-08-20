@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 from pathlib import Path
 
 import pytest
 
 from multichannel.db import connect, migrate
-from multichannel.jobs import claim_job, transition_job
+from multichannel.jobs import ClaimedJob, InvalidTransition, claim_job, transition_job
 
 
 NOW = "2026-08-21T00:00:00Z"
@@ -27,22 +28,30 @@ def test_two_independent_connections_only_one_claims(tmp_path: Path) -> None:
     path = tmp_path / "concurrent.sqlite3"
     _setup(path)
     barrier = threading.Barrier(2)
-    results: list[object] = []
+    outcomes: list[ClaimedJob | None] = []
+    errors: list[BaseException] = []
 
     def worker(worker_id: str) -> None:
-        connection = connect(path)
-        barrier.wait()
+        connection: sqlite3.Connection | None = None
         try:
-            results.append(claim_job(connection, "job-1", worker_id, NOW))
+            connection = connect(path)
+            barrier.wait()
+            outcomes.append(claim_job(connection, "job-1", worker_id, NOW))
+        except BaseException as error:
+            errors.append(error)
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     threads = [threading.Thread(target=worker, args=(f"worker-{i}",)) for i in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    assert sum(result is not None for result in results) == 1
+    assert len(outcomes) == 2
+    assert not errors
+    assert sum(isinstance(outcome, ClaimedJob) for outcome in outcomes) == 1
+    assert outcomes.count(None) == 1
     connection = connect(path)
     assert connection.execute("SELECT attempt_count, state FROM job_runs").fetchone() == (1, "claimed")
     assert connection.execute("SELECT COUNT(*) FROM job_events").fetchone() == (1,)
@@ -84,3 +93,55 @@ def test_claimed_job_can_transition_to_running(tmp_path: Path) -> None:
     assert claim_job(connection, "job-1", "worker", NOW)
     transition_job(connection, "job-1", "claimed", "running", "worker", now=NOW)
     assert connection.execute("SELECT state FROM job_runs").fetchone() == ("running",)
+
+
+def test_concurrent_transitions_return_application_error_not_sqlite_lock(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "transition-race.sqlite3"
+    _setup(path)
+    connection = connect(path)
+    assert claim_job(connection, "job-1", "worker", NOW) is not None
+    connection.close()
+    read_barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+    errors: list[BaseException] = []
+
+    def worker(target_state: str) -> None:
+        worker_connection = connect(path)
+        trace_state = threading.local()
+        trace_state.deferred_begin = False
+
+        def synchronize_deferred_read(statement: str) -> None:
+            if statement == "BEGIN":
+                trace_state.deferred_begin = True
+            elif (
+                trace_state.deferred_begin
+                and statement.startswith("SELECT state, worker_id FROM job_runs")
+            ):
+                read_barrier.wait(timeout=5)
+
+        worker_connection.set_trace_callback(
+            synchronize_deferred_read
+        )
+        try:
+            transition_job(worker_connection, "job-1", "claimed", target_state, "worker", now=NOW)
+            outcomes.append(target_state)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            worker_connection.close()
+
+    threads = [
+        threading.Thread(target=worker, args=("running",)),
+        threading.Thread(target=worker, args=("cancelled",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(outcomes) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], InvalidTransition)
+    assert not isinstance(errors[0], sqlite3.OperationalError)

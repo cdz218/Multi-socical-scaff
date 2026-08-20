@@ -406,7 +406,9 @@ def transition_job(
         raise InvalidTransition("errors are only valid for failed, deferred, or ambiguous jobs")
     _reject_active_transaction(connection)
     safe_actor = _sanitize_identity(actor)
-    error_class = _sanitize_text(error.__class__.__name__) if error is not None else None
+    # Error class names can carry credential-like suffixes; derive one safe value
+    # and reuse it for both durable job state and the matching event.
+    error_class = _sanitize_identity(error.__class__.__name__) if error is not None else None
     error_detail = _sanitize_text(str(error)) if error is not None else None
     partial_json = _json(partial_state) if partial_state is not None else None
     assignments = ["state=?", "updated_at=?"]
@@ -429,7 +431,7 @@ def transition_job(
         assignments.extend(["error_class=?", "error_detail=?", "partial_state_json=?"])
         values.extend([error_class, error_detail, partial_json])
     try:
-        connection.execute("BEGIN")
+        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT state, worker_id FROM job_runs WHERE id=?", (job_id,)
         ).fetchone()
@@ -480,7 +482,14 @@ def requeue_job(
             "SELECT job_run_id, operator, reason FROM requeue_requests WHERE request_key=?", (safe_request_key,)
         ).fetchone()
         if request is not None:
-            if request == (job_id, safe_operator, safe_reason):
+            request_job_id = request[0]
+            request_operator = request[1]
+            request_reason = request[2]
+            if (request_job_id, request_operator, request_reason) == (
+                job_id,
+                safe_operator,
+                safe_reason,
+            ):
                 connection.commit()
                 return False
             raise InvalidTransition("request key was already used with different requeue details")

@@ -107,6 +107,32 @@ def test_terminal_states_reject_transitions(tmp_path: Path, old: str) -> None:
         transition_job(connection, "job-1", old, "queued", "worker")
 
 
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("claimed", "succeeded"),
+        ("running", "queued"),
+        ("failed", "succeeded"),
+        ("deferred", "failed"),
+        ("ambiguous", "succeeded"),
+        ("cancelled", "running"),
+        ("succeeded", "running"),
+    ],
+)
+def test_remaining_illegal_transition_matrix_does_not_mutate(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    connection = _connection(tmp_path)
+    _insert_job(connection, old)
+    before = _counts(connection)
+
+    with pytest.raises(InvalidTransition):
+        transition_job(connection, "job-1", old, new, "worker", now=NOW)
+
+    assert connection.execute("SELECT state FROM job_runs WHERE id='job-1'").fetchone() == (old,)
+    assert _counts(connection) == before
+
+
 def test_expected_state_mismatch_does_not_mutate(tmp_path: Path) -> None:
     connection = _connection(tmp_path)
     _insert_job(connection, "running")
@@ -142,6 +168,26 @@ def test_partial_failure_is_sanitized_and_canonical(tmp_path: Path) -> None:
     detail = connection.execute("SELECT detail_json FROM job_events").fetchone()[0]
     assert SECRET not in detail
     assert "traceback" not in detail
+
+
+def test_credential_bearing_error_class_is_absent_from_job_and_event_rows(tmp_path: Path) -> None:
+    connection = _connection(tmp_path)
+    _insert_job(connection, "running")
+    raw_error_class = "PasswordSecretClass_ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    error = type(raw_error_class, (RuntimeError,), {})("remote failure")
+
+    transition_job(connection, "job-1", "running", "failed", "worker", error=error, now=NOW)
+
+    error_class = connection.execute("SELECT error_class FROM job_runs").fetchone()[0]
+    detail = connection.execute("SELECT detail_json FROM job_events").fetchone()[0]
+    persisted = "\n".join(
+        str(value)
+        for table in ("job_runs", "job_events")
+        for row in connection.execute(f"SELECT * FROM {table}").fetchall()
+        for value in row
+    )
+    assert raw_error_class not in persisted
+    assert error_class == json.loads(detail)["error_class"]
 
 
 def test_credential_shaped_values_are_sanitized_in_every_free_text_sink(tmp_path: Path) -> None:
@@ -449,6 +495,20 @@ def test_requeue_is_idempotent_and_conflicts_rejected(tmp_path: Path) -> None:
     _insert_job(connection, "failed", "job-2")
     with pytest.raises(InvalidTransition):
         requeue_job(connection, "job-2", "other", "different", "request-1", now=NOW)
+
+
+def test_requeue_idempotency_is_independent_of_sqlite_row_factory(tmp_path: Path) -> None:
+    connection = _connection(tmp_path)
+    _insert_job(connection, "failed")
+
+    assert requeue_job(connection, "job-1", "operator", "retry", "request-1", now=NOW)
+    counts = _counts(connection)
+    connection.row_factory = sqlite3.Row
+
+    assert not requeue_job(connection, "job-1", "operator", "retry", "request-1", now=NOW)
+    assert _counts(connection) == counts
+    with pytest.raises(InvalidTransition, match="different requeue details"):
+        requeue_job(connection, "job-1", "operator", "different", "request-1", now=NOW)
 
 
 def test_credential_shaped_request_keys_are_distinct_and_idempotent(tmp_path: Path) -> None:
