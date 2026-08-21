@@ -14,6 +14,9 @@ _FOUNDATION_TABLES = {
     "job_runs",
     "job_events",
     "requeue_requests",
+    "github_repositories",
+    "github_releases",
+    "source_observations",
 }
 
 
@@ -25,13 +28,12 @@ def test_connect_enables_foreign_keys_wal_and_busy_timeout(tmp_path: Path) -> No
     assert connection.execute("PRAGMA busy_timeout").fetchone() == (5000,)
 
 
-def test_empty_database_upgrades_through_only_current_foundation_migration(tmp_path: Path) -> None:
-    """Later migrations are intentionally owned by later tasks and do not exist yet."""
+def test_empty_database_upgrades_through_current_migrations(tmp_path: Path) -> None:
     connection = connect(tmp_path / "state.sqlite3")
 
-    assert migrate(connection) == 1
+    assert migrate(connection) == 2
     assert connection.execute("SELECT migration_id FROM schema_migrations").fetchall() == [
-        ("0001",)
+        ("0001",), ("0002",)
     ]
 
 
@@ -57,10 +59,10 @@ def test_concurrent_connections_migrate_an_empty_database_once(tmp_path: Path) -
                 row[0]
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             }
-            assert results == [1, 1]
+            assert results == [2, 2]
             assert tables == _FOUNDATION_TABLES
             assert connection.execute("SELECT migration_id FROM schema_migrations").fetchall() == [
-                ("0001",)
+                ("0001",), ("0002",)
             ]
         finally:
             connection.close()
