@@ -27,11 +27,11 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
     }
 
 
-def test_migrate_is_idempotent_and_creates_only_foundation_tables(tmp_path: Path) -> None:
+def test_migrate_is_idempotent_and_creates_current_tables(tmp_path: Path) -> None:
     connection = connect(tmp_path / "state.sqlite3")
 
-    assert migrate(connection) == 1
-    assert migrate(connection) == 1
+    assert migrate(connection) == 2
+    assert migrate(connection) == 2
     assert _table_names(connection) == {
         "schema_migrations",
         "channels",
@@ -39,9 +39,12 @@ def test_migrate_is_idempotent_and_creates_only_foundation_tables(tmp_path: Path
         "job_runs",
         "job_events",
         "requeue_requests",
+        "github_repositories",
+        "github_releases",
+        "source_observations",
     }
     assert not _table_names(connection).intersection({"concepts", "publishers", "media"})
-    assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (1,)
+    assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (2,)
 
 
 def test_migrate_refuses_a_changed_recorded_migration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -364,13 +367,84 @@ def test_migrate_preserves_trigger_statement_boundaries(
     assert connection.execute("SELECT value FROM audit ORDER BY value").fetchall() == [(7,), (8,)]
 
 
-def test_existing_0001_database_is_unchanged_on_repeat_migration(tmp_path: Path) -> None:
+def test_current_database_is_unchanged_on_repeat_migration(tmp_path: Path) -> None:
     connection = connect(tmp_path / "state.sqlite3")
-    assert migrate(connection) == 1
+    assert migrate(connection) == 2
     before = connection.execute("SELECT migration_id, applied_at, sha256 FROM schema_migrations").fetchall()
 
-    assert migrate(connection) == 1
+    assert migrate(connection) == 2
     assert connection.execute("SELECT migration_id, applied_at, sha256 FROM schema_migrations").fetchall() == before
+
+
+def test_migrate_upgrades_an_actual_0001_database_without_changing_0001_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    migration_tree = tmp_path / "migrations"
+    migration_tree.mkdir()
+    source_tree = Path(__file__).parents[2] / "multichannel" / "migrations"
+    first = migration_tree / "0001_foundation.sql"
+    first.write_bytes((source_tree / "0001_foundation.sql").read_bytes())
+    monkeypatch.setattr(db, "MIGRATIONS_DIRECTORY", migration_tree)
+    connection = connect(tmp_path / "state.sqlite3")
+    assert migrate(connection) == 1
+    before = connection.execute(
+        "SELECT migration_id, applied_at, sha256 FROM schema_migrations WHERE migration_id = '0001'"
+    ).fetchone()
+    (migration_tree / "0002_github.sql").write_bytes((source_tree / "0002_github.sql").read_bytes())
+
+    assert migrate(connection) == 2
+    assert connection.execute(
+        "SELECT migration_id, applied_at, sha256 FROM schema_migrations WHERE migration_id = '0001'"
+    ).fetchone() == before
+    assert "source_observations" in _table_names(connection)
+
+
+def test_github_schema_defers_reddit_fks_and_keeps_github_parent_identity_agreement(tmp_path: Path) -> None:
+    connection = connect(tmp_path / "state.sqlite3")
+    migrate(connection)
+    schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'source_observations'"
+    ).fetchone()[0]
+    repository_schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'github_repositories'"
+    ).fetchone()[0]
+
+    foreign_keys = {
+        (row[3], row[2])
+        for row in connection.execute("PRAGMA foreign_key_list(source_observations)")
+    }
+    assert ("github_repository_id", "github_repositories") in foreign_keys
+    assert ("github_release_id", "github_releases") in foreign_keys
+    assert "reddit_post_id TEXT" in schema
+    assert "reddit_comment_id TEXT" in schema
+    assert "reddit_post_id TEXT REFERENCES" not in schema
+    assert "reddit_comment_id TEXT REFERENCES" not in schema
+    assert "source_identity='github_repository:' || github_repository_id" in schema
+    assert "source_identity='github_release:' || github_release_id" in schema
+    assert "source_identity='reddit_post:' || reddit_post_id" in schema
+    assert "source_identity='reddit_comment:' || reddit_comment_id" in schema
+    assert "length(readme_sha256)=64" in repository_schema
+
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """INSERT INTO source_observations
+               (id, source_kind, source_identity, observed_at, github_repository_id, metrics_json,
+                raw_sha256, raw_path, created_at)
+               VALUES ('unknown-repository', 'github_repository',
+                       'github_repository:missing', '2026-08-21T00:00:00Z', 'missing', '{}', ?,
+                       'x', '2026-08-21T00:00:00Z')""",
+            ("a" * 64,),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """INSERT INTO github_repositories
+               (id, github_id, owner, name, canonical_url, api_url, default_branch, topics_json,
+                readme_sha256, created_at)
+               VALUES ('bad-hash', '1', 'acme', 'bad', 'https://github.com/acme/bad',
+                       'https://api.github.com/repos/acme/bad', 'main', '[]', 'ABC',
+                       '2026-08-21T00:00:00Z')"""
+        )
 
 
 def test_factories_generate_uuid_ids_and_utc_z_timestamps() -> None:
