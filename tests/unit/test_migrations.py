@@ -436,6 +436,37 @@ def test_github_schema_defers_reddit_fks_and_keeps_github_parent_identity_agreem
             ("a" * 64,),
         )
 
+
+@pytest.mark.parametrize("invalid_id", ["github-id", "+42", " 42", "42 ", "04"])
+def test_github_schema_rejects_noncanonical_numeric_ids(tmp_path: Path, invalid_id: str) -> None:
+    connection = connect(tmp_path / "state.sqlite3")
+    migrate(connection)
+    connection.execute(
+        """INSERT INTO github_repositories
+           (id, github_id, owner, name, canonical_url, api_url, default_branch, topics_json, created_at)
+           VALUES ('parent', '42', 'acme', 'widgets', 'https://github.com/acme/widgets',
+                   'https://api.github.com/repos/acme/widgets', 'main', '[]', '2026-08-21T00:00:00Z')"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """INSERT INTO github_repositories
+               (id, github_id, owner, name, canonical_url, api_url, default_branch, topics_json, created_at)
+               VALUES ('invalid-repository', ?, 'acme', 'invalid-repository',
+                       'https://github.com/acme/invalid-repository',
+                       'https://api.github.com/repos/acme/invalid-repository', 'main', '[]',
+                       '2026-08-21T00:00:00Z')""",
+            (invalid_id,),
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """INSERT INTO github_releases
+               (id, repository_id, github_release_id, tag_name, html_url, created_at)
+               VALUES ('invalid-release', 'parent', ?, 'v1',
+                       'https://github.com/acme/widgets/releases/tag/v1', '2026-08-21T00:00:00Z')""",
+            (invalid_id,),
+        )
+
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             """INSERT INTO github_repositories

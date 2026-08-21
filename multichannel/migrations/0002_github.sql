@@ -1,8 +1,8 @@
 CREATE TABLE github_repositories (
   id TEXT PRIMARY KEY,
-  github_id TEXT NOT NULL UNIQUE,
-  owner TEXT NOT NULL,
-  name TEXT NOT NULL,
+  github_id TEXT NOT NULL UNIQUE CHECK(length(github_id) > 0 AND github_id NOT GLOB '*[^0-9]*' AND (github_id = '0' OR substr(github_id, 1, 1) <> '0')),
+  owner TEXT NOT NULL COLLATE NOCASE,
+  name TEXT NOT NULL COLLATE NOCASE,
   canonical_url TEXT NOT NULL UNIQUE,
   api_url TEXT NOT NULL UNIQUE,
   default_branch TEXT NOT NULL,
@@ -21,7 +21,7 @@ CREATE TABLE github_repositories (
 CREATE TABLE github_releases (
   id TEXT PRIMARY KEY,
   repository_id TEXT NOT NULL REFERENCES github_repositories(id),
-  github_release_id TEXT NOT NULL UNIQUE,
+  github_release_id TEXT NOT NULL UNIQUE CHECK(length(github_release_id) > 0 AND github_release_id NOT GLOB '*[^0-9]*' AND (github_release_id = '0' OR substr(github_release_id, 1, 1) <> '0')),
   tag_name TEXT NOT NULL,
   name TEXT,
   body TEXT,
