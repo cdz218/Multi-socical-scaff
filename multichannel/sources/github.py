@@ -617,24 +617,32 @@ def _capture_identity(path: Path) -> tuple[int, int]:
 
 
 def _remove_published_capture_if_owned(
-    root: Path, target: Path, ownership: tuple[int, int]
+    root: Path, target: Path, retained_staging: Path
 ) -> None:
-    """Remove a published destination only while its inode remains ours."""
+    """Remove a published destination only while the retained staging link owns it."""
     try:
+        _validated_capture_target(root, retained_staging)
         _validated_capture_target(root, target)
-        target_status = target.stat(follow_symlinks=False)
+        staging_identity = _capture_identity(retained_staging)
+        target_identity = _capture_identity(target)
     except (FileNotFoundError, ValueError):
         return
-    if stat.S_ISREG(target_status.st_mode) and (
-        target_status.st_dev,
-        target_status.st_ino,
-    ) == ownership:
+    if target_identity == staging_identity:
         target.unlink()
+
+
+def _remove_retained_staging(root: Path, temporary: Path) -> None:
+    """Remove a private staging link only while it remains safely contained."""
+    try:
+        _validated_capture_target(root, temporary)
+    except ValueError:
+        return
+    temporary.unlink(missing_ok=True)
 
 
 def _finalize_capture(
     root: Path, temporary: Path, target: Path, expected_sha: str
-) -> tuple[int, int] | None:
+) -> Path | None:
     _validated_capture_target(root, target)
     try:
         # Linking publishes only if absent, so a pre-existing capture is never overwritten.
@@ -644,27 +652,33 @@ def _finalize_capture(
         _existing_capture_matches(target, expected_sha)
         temporary.unlink(missing_ok=True)
         return None
-    # The staging inode identifies this publication even if the path is replaced later.
-    ownership = _capture_identity(temporary)
     try:
         _validated_capture_target(root, target)
         _existing_capture_matches(target, expected_sha)
     except Exception:
-        _remove_published_capture_if_owned(root, target, ownership)
+        _remove_published_capture_if_owned(root, target, temporary)
+        _remove_retained_staging(root, temporary)
         raise
-    temporary.unlink(missing_ok=True)
-    return ownership
+    # Keep the second link until the caller settles its database transaction.
+    return temporary
 
 
 def write_capture(root: Path, observation: SourceObservationInput) -> str:
     temporary, target, capture_root, relative_path = _stage_capture(root, observation)
+    retained_staging: Path | None = None
     try:
-        _finalize_capture(capture_root, temporary, target, hashlib.sha256(observation.raw_bytes).hexdigest())
+        retained_staging = _finalize_capture(
+            capture_root, temporary, target, hashlib.sha256(observation.raw_bytes).hexdigest()
+        )
+        if not target.resolve().is_relative_to(capture_root):
+            raise ValueError("capture path escaped approved root")
     except Exception:
-        temporary.unlink(missing_ok=True)
+        if retained_staging is not None:
+            _remove_published_capture_if_owned(capture_root, target, retained_staging)
+        _remove_retained_staging(capture_root, temporary)
         raise
-    if not target.resolve().is_relative_to(capture_root):
-        raise ValueError("capture path escaped approved root")
+    if retained_staging is not None:
+        _remove_retained_staging(capture_root, retained_staging)
     return relative_path
 
 
@@ -716,21 +730,25 @@ def persist_observation(connection: sqlite3.Connection, observation: SourceObser
     )
     temporary, target, validated_root, relative_path = _stage_capture(capture_root, persisted_observation)
     observation_id = str(uuid4())
-    capture_ownership: tuple[int, int] | None = None
+    retained_staging: Path | None = None
     try:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             "INSERT INTO source_observations (id, source_kind, source_identity, observed_at, github_repository_id, github_release_id, metrics_json, raw_sha256, raw_path, incomplete_results, rate_limit_remaining, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (observation_id, persisted_observation.source_kind, source_identity, normalize_timestamp(observation.observed_at), repository_id, release_id, json.dumps(observation.metrics, sort_keys=True, separators=(",", ":")), raw_sha, relative_path, int(observation.incomplete_results), observation.rate_limit_remaining, normalize_timestamp(datetime.now(_UTC))),
         )
-        capture_ownership = _finalize_capture(validated_root, temporary, target, raw_sha)
+        retained_staging = _finalize_capture(validated_root, temporary, target, raw_sha)
         connection.commit()
     except Exception:
-        connection.rollback()
-        temporary.unlink(missing_ok=True)
-        if capture_ownership is not None:
-            _remove_published_capture_if_owned(validated_root, target, capture_ownership)
+        try:
+            connection.rollback()
+        finally:
+            if retained_staging is not None:
+                _remove_published_capture_if_owned(validated_root, target, retained_staging)
+            _remove_retained_staging(validated_root, temporary)
         raise
+    if retained_staging is not None:
+        _remove_retained_staging(validated_root, retained_staging)
     return observation_id
 
 

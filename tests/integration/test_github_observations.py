@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,7 @@ class _ControlledConnection(sqlite3.Connection):
     fail_repository_lookup = False
     fail_release_lookup = False
     fail_commit = False
+    commit_hook: Callable[[], None] | None = None
 
     def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
         if self.fail_repository_lookup and sql.startswith("SELECT id FROM github_repositories"):
@@ -34,6 +36,8 @@ class _ControlledConnection(sqlite3.Connection):
         return super().execute(sql, parameters)
 
     def commit(self) -> None:
+        if self.commit_hook is not None:
+            self.commit_hook()
         if self.fail_commit:
             raise sqlite3.OperationalError("controlled commit failure")
         super().commit()
@@ -73,6 +77,10 @@ def _release(repository_github_id: str = "42") -> GitHubRelease:
         html_url="https://github.com/acme/widgets/releases/tag/v1.0.0",
         published_at="2026-08-20T00:00:00Z",
     )
+
+
+def _private_capture_files(captures: Path) -> list[Path]:
+    return [path for path in captures.rglob(".*.tmp") if path.is_file()]
 
 
 def test_second_capture_is_a_second_observation_not_a_second_repository(tmp_path: Path) -> None:
@@ -375,6 +383,49 @@ def test_direct_release_persistence_accepts_a_valid_encoded_tag(tmp_path: Path) 
     ]
 
 
+def test_commit_success_cleans_retained_staging_after_the_commit_attempt(tmp_path: Path) -> None:
+    connection = _controlled_connection(tmp_path / "state.sqlite3")
+    migrate(connection)
+    repository_id = persist_github_repository(connection, _repository())
+    captures = tmp_path / ".runtime" / "captures"
+    observation = _observation(datetime(2026, 8, 21, tzinfo=timezone.utc), b'{"id":42}')
+
+    def assert_retained_staging() -> None:
+        staging = _private_capture_files(captures)
+        published = [
+            path for path in captures.rglob("*") if path.is_file() and path not in staging
+        ]
+        assert len(staging) == len(published) == 1
+        assert (staging[0].stat().st_dev, staging[0].stat().st_ino) == (
+            published[0].stat().st_dev,
+            published[0].stat().st_ino,
+        )
+
+    connection.commit_hook = assert_retained_staging
+    observation_id = persist_observation(connection, observation, captures, repository_id=repository_id)
+
+    assert connection.execute("SELECT id FROM source_observations").fetchall() == [(observation_id,)]
+    assert [path.read_bytes() for path in captures.rglob("*") if path.is_file()] == [b'{"id":42}']
+    assert _private_capture_files(captures) == []
+
+
+def test_rollback_removes_an_unchanged_owned_capture_and_retained_staging(tmp_path: Path) -> None:
+    connection = _controlled_connection(tmp_path / "state.sqlite3")
+    migrate(connection)
+    repository_id = persist_github_repository(connection, _repository())
+    captures = tmp_path / ".runtime" / "captures"
+    observation = _observation(datetime(2026, 8, 21, tzinfo=timezone.utc), b'{"id":42}')
+    connection.fail_commit = True
+
+    with pytest.raises(sqlite3.OperationalError, match="controlled commit failure"):
+        persist_observation(connection, observation, captures, repository_id=repository_id)
+
+    connection.fail_commit = False
+    assert connection.execute("SELECT COUNT(*) FROM source_observations").fetchone() == (0,)
+    assert [path for path in captures.rglob("*") if path.is_file()] == []
+    assert _private_capture_files(captures) == []
+
+
 def test_rollback_cleanup_keeps_a_replacement_capture_it_does_not_own(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -404,4 +455,4 @@ def test_rollback_cleanup_keeps_a_replacement_capture_it_does_not_own(
     capture_files = [path for path in captures.rglob("*") if path.is_file()]
     assert [path.read_bytes() for path in capture_files] == [b"replacement"]
     assert connection.execute("SELECT COUNT(*) FROM source_observations").fetchone() == (0,)
-    assert not [path for path in captures.rglob(".*.tmp") if path.is_file()]
+    assert _private_capture_files(captures) == []
